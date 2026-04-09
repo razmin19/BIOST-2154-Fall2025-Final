@@ -1,0 +1,427 @@
+---
+title: "Chromatin Accessibility Changes Across Developmental Time Points in Human Corticogenesis"
+author: "Razmin Bari"
+output: html_document
+date: "2025-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(Matrix)
+library(Seurat)
+library(Signac)
+library(ggplot2)
+library(GenomicRanges)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+
+```{r}
+meta <- fread("~/final_biost2154/data/GSE162170_atac_cell_metadata.txt.gz")
+rownames(meta) <- meta$Cell.ID
+
+# sample 3000 cells
+set.seed(123)
+subset_cells <- sample(meta$Cell.ID, 3000)
+```
+
+```{r}
+# internal mapping
+cell_index_lookup <- match(subset_cells, meta$Cell.ID)
+
+counts_subset <- fread(
+  "~/final_biost2154/data/GSE162170_atac_counts.tsv.gz",
+  select = cell_index_lookup,
+  header = FALSE
+)
+```
+
+```{r}
+mat <- as(as.matrix(counts_subset), "dgCMatrix")
+rownames(mat) <- paste0("peak_", seq_len(nrow(mat)))
+colnames(mat) <- subset_cells
+
+```
+
+```{r}
+peaks <- fread("~/final_biost2154/data/GSE162170_atac_consensus_peaks.bed.gz",
+               header = FALSE)
+
+# Keep only BED3 (chr, start, end)
+peaks3 <- peaks[, 1:3]
+setnames(peaks3, c("chr", "start", "end"))
+
+gr <- makeGRangesFromDataFrame(peaks3)
+names(gr) <- rownames(mat)
+
+```
+
+```{r}
+meta_df <- as.data.frame(meta)
+rownames(meta_df) <- meta_df$Cell.ID
+meta.data <- meta_df[subset_cells, ]
+
+# Create a ChromatinAssay (this attaches the GRanges peaks properly)
+chrom_assay <- CreateChromatinAssay(
+  counts = mat,
+  ranges = gr,
+  genome = "hg38",
+  sep = c("-", "-")
+)
+
+# Build Seurat object using this assay
+atac <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "ATAC",
+  meta.data = meta.data
+)
+
+
+```
+
+# Aim 1{.tabset}
+
+## Compute total counts per cell + normalization
+```{r}
+atac$TotalCounts <- Matrix::colSums(atac@assays$ATAC@counts)
+atac$log10_TotalCounts <- log10(atac$TotalCounts + 1)
+
+```
+
+## Violin plot by developmental stage
+```{r}
+VlnPlot(atac, "log10_TotalCounts", group.by = "Age")
+VlnPlot(
+    atac,
+    features = "log10_TotalCounts",
+    group.by = "Age",
+    pt.size = 0.1
+) + 
+    geom_boxplot(width = 0.15, fill = "white", color = "black", outlier.shape = NA)
+
+```
+
+## Kruskal-Wallis test
+```{r}
+kruskal.test(log10_TotalCounts ~ Age, data = atac@meta.data)
+```
+
+## Compute TF-IDF and UMAP
+```{r}
+atac <- RunTFIDF(atac)
+atac <- FindTopFeatures(atac)
+atac <- RunSVD(atac)
+atac <- RunUMAP(atac, reduction = "lsi", dims = 2:30)
+```
+
+```{r}
+DimPlot(atac, group.by = "Age") +
+  ggtitle("Chromatin Accessibility UMAP grouped by Developmental Age")
+DimPlot(atac, group.by = "Tissue.ID", label = TRUE, repel = TRUE) +
+    ggtitle("Tissue-Specific Chromatin Accessibility UMAP")
+DimPlot(
+    atac,
+    group.by = "Tissue.ID",
+    split.by = "Age",
+    label = TRUE,
+    repel = TRUE
+) + ggtitle("Tissue-Specific Chromatin Accessibility UMAP Split by Age")
+
+DimPlot(
+    atac,
+    group.by = "Age",
+    split.by = "Tissue.ID",
+    label = TRUE,
+    repel = TRUE
+) + ggtitle("Tissue-Specific Chromatin Accessibility UMAP Split by Age")
+
+```
+
+# Aim 2{.tabset}
+
+## Differential Accessibility across the developmental time points (with the earliest time point pcw16 as the baseline) (ANOVA)
+```{r}
+# -----------------------------
+# 1. Filter low-accessibility peaks
+# -----------------------------
+
+# Keep peaks present in >=1% of cells
+min_cells <- ceiling(0.01 * ncol(atac))
+peak_filter <- rowSums(atac@assays$ATAC@counts > 0) >= min_cells
+atac_filtered <- subset(atac, features = rownames(atac)[peak_filter])
+
+cat("Number of peaks after filtering:", nrow(atac_filtered), "\n")
+
+# -----------------------------
+# 2. Set Idents by developmental stage
+# -----------------------------
+atac_filtered$Age <- factor(atac_filtered$Age,
+                            levels = c("pcw16", "pcw20", "pcw21", "pcw24"))
+Idents(atac_filtered) <- atac_filtered$Age
+
+saveRDS(atac_filtered, file = "atac_filtered_2154.rds")
+# -----------------------------
+# 3. Pairwise differential accessibility (PCW16 baseline)
+# -----------------------------
+ages <- levels(atac_filtered$Age)
+
+# # pcw20 vs pcw16
+# da_pcw20_vs_pcw16 <- FindMarkers(
+#   object = atac_filtered,
+#   ident.1 = "pcw20",
+#   ident.2 = "pcw16",
+#   test.use = "LR",
+#   latent.vars = "nCount_ATAC",
+#   min.pct = 0.05
+# )
+# 
+# # pcw21 vs pcw16
+# da_pcw21_vs_pcw16 <- FindMarkers(
+#   object = atac_filtered,
+#   ident.1 = "pcw21",
+#   ident.2 = "pcw16",
+#   test.use = "LR",
+#   latent.vars = "nCount_ATAC",
+#   min.pct = 0.05
+# )
+# 
+# # pcw24 vs pcw16
+# da_pcw24_vs_pcw16 <- FindMarkers(
+#   object = atac_filtered,
+#   ident.1 = "pcw24",
+#   ident.2 = "pcw16",
+#   test.use = "LR",
+#   latent.vars = "nCount_ATAC",
+#   min.pct = 0.05
+# )
+
+# saveRDS(da_pcw20_vs_pcw16, file = "da_20vs16_2154")
+# saveRDS(da_pcw21_vs_pcw16, file = "da_21vs16_2154")
+# saveRDS(da_pcw24_vs_pcw16, file = "da_24vs16_2154")
+
+# Load differential accessibility result objects
+da_pcw20_vs_pcw16 <- readRDS("da_20vs16_2154")
+da_pcw21_vs_pcw16 <- readRDS("da_21vs16_2154")
+da_pcw24_vs_pcw16 <- readRDS("da_24vs16_2154")
+
+# -----------------------------
+# 4. Extract significant peaks
+# -----------------------------
+sig_pcw20_vs_pcw16 <- subset(da_pcw20_vs_pcw16, p_val_adj < 0.05 & abs(avg_log2FC) > 0.25)
+sig_pcw21_vs_pcw16 <- subset(da_pcw21_vs_pcw16, p_val_adj < 0.05 & abs(avg_log2FC) > 0.25)
+sig_pcw24_vs_pcw16 <- subset(da_pcw24_vs_pcw16, p_val_adj < 0.05 & abs(avg_log2FC) > 0.25)
+
+
+# -----------------------------
+# 5. Annotate peaks with nearest genes
+# -----------------------------
+annotations <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+Annotation(atac_filtered) <- annotations
+
+annot_pcw20 <- ClosestFeature(atac_filtered, rownames(sig_pcw20_vs_pcw16))
+annot_pcw21 <- ClosestFeature(atac_filtered, rownames(sig_pcw21_vs_pcw16))
+annot_pcw24 <- ClosestFeature(atac_filtered, rownames(sig_pcw24_vs_pcw16))
+
+```
+
+```{r}
+# -----------------------------
+# 6. Motif enrichment
+# -----------------------------
+# Add motifs
+pfm <- getMatrixSet(JASPAR2020, opts = list(species = 9606, all_versions = FALSE))
+atac_filtered <- AddMotifs(
+  object = atac_filtered,
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  pfm = pfm
+)
+
+# Helper function to add TF names to motif results
+add_tf_names <- function(motif_results) {
+  motif_ids <- rownames(motif_results)  # e.g., MA0161.2
+  # get JASPAR motifs
+  motifs_db <- getMatrixSet(JASPAR2020, opts = list(species = 9606, all_versions = FALSE))
+  
+  tf_names <- sapply(motif_ids, function(id) {
+    if(id %in% names(motifs_db)) {
+      name(motifs_db[[id]])
+    } else {
+      NA
+    }
+  })
+  
+  motif_results$TF <- tf_names
+  return(motif_results)
+}
+
+library(ggplot2)
+
+plot_volcano <- function(da_df, title = "") {
+  da_df$Significant <- ifelse(da_df$p_val_adj < 0.05 & abs(da_df$avg_log2FC) > 0.25, "Yes", "No")
+  
+  ggplot(da_df, aes(x = avg_log2FC, y = -log10(p_val_adj), color = Significant)) +
+    geom_point(alpha = 0.6, size = 1) +
+    scale_color_manual(values = c("No" = "grey", "Yes" = "red")) +
+    theme_minimal() +
+    labs(title = title,
+         x = "log2 Fold Change",
+         y = "-log10 Adjusted P-value")
+}
+
+# Example: PCW24 vs PCW16
+plot_volcano(sig_pcw24_vs_pcw16, title = "Volcano Plot: PCW24 vs PCW16")
+
+plot_volcano(sig_pcw21_vs_pcw16, title = "Volcano Plot: PCW21 vs PCW16")
+
+plot_volcano(sig_pcw20_vs_pcw16, title = "Volcano Plot: PCW20 vs PCW16")
+
+```
+
+```{r}
+# -----------------------------
+# PCW20 vs PCW16
+da_peaks <- rownames(sig_pcw20_vs_pcw16)
+da_peaks <- da_peaks[da_peaks %in% rownames(atac_filtered)]
+motif_results_PCW20 <- FindMotifs(object = atac_filtered, features = da_peaks)
+motif_results_PCW20 <- add_tf_names(motif_results_PCW20)
+head(motif_results_PCW20)
+
+# -----------------------------
+# PCW21 vs PCW16
+da_peaks2 <- rownames(sig_pcw21_vs_pcw16)
+da_peaks2 <- da_peaks2[da_peaks2 %in% rownames(atac_filtered)]
+motif_results_PCW21 <- FindMotifs(object = atac_filtered, features = da_peaks2)
+motif_results_PCW21 <- add_tf_names(motif_results_PCW21)
+head(motif_results_PCW21)
+
+# -----------------------------
+# PCW24 vs PCW16
+da_peaks3 <- rownames(sig_pcw24_vs_pcw16)
+da_peaks3 <- da_peaks3[da_peaks3 %in% rownames(atac_filtered)]
+motif_results_PCW24 <- FindMotifs(object = atac_filtered, features = da_peaks3)
+motif_results_PCW24 <- add_tf_names(motif_results_PCW24)
+head(motif_results_PCW24)
+
+library(tidyverse)
+library(knitr)
+# Example: PCW20 motif results
+pretty_PCW20 <- motif_results_PCW20 %>%
+  select(motif, TF, fold.enrichment, p.adjust, observed) %>%   # pick relevant columns
+  arrange(desc(fold.enrichment)) %>%                           # optional: sort by enrichment
+  filter(p.adjust < 0.05)                                      # optional: show only significant motifs
+
+# Create a nice table
+kable(pretty_PCW20, 
+      caption = "Top enriched motifs in PCW20 vs PCW16",
+      col.names = c("Motif ID", "Transcription Factor", "Fold Enrichment", "Adjusted P-value", "# Peaks"),
+      digits = 3)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Example: PCW20 pretty table
+pretty_PCW20 <- motif_results_PCW20 %>%
+  dplyr::select(TF, fold.enrichment, p.adjust) %>%
+  dplyr::filter(p.adjust < 0.05)
+
+# Assign categories manually
+pretty_PCW20 <- pretty_PCW20 %>%
+  mutate(Category = case_when(
+    TF %in% c("PAX6", "ASCL1") ~ "Progenitor TF",
+    TF %in% c("NEUROD1", "TBR1", "MEF2C", "NEUROG2") ~ "Neuronal TF",
+    TRUE ~ "Other"
+  ))
+
+# Summarize counts or mean enrichment per category
+summary_PCW20 <- pretty_PCW20 %>%
+  group_by(Category) %>%
+  summarise(Count = n(),
+            MeanEnrichment = mean(fold.enrichment))
+
+# Bar chart: count of enriched motifs per category
+ggplot(summary_PCW20, aes(x = Category, y = Count, fill = Category)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Number of Enriched Motifs by TF Category (PCW20 vs PCW16)",
+       x = "TF Category",
+       y = "Number of Motifs") +
+  theme(legend.position = "none")
+
+ggplot(summary_PCW20, aes(x = Category, y = MeanEnrichment, fill = Category)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Average Fold Enrichment by TF Category (PCW20 vs PCW16)",
+       x = "TF Category",
+       y = "Mean Fold Enrichment") +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Add stage column
+sig_pcw20 <- sig_pcw20_vs_pcw16 %>% mutate(Stage = "PCW20")
+sig_pcw21 <- sig_pcw21_vs_pcw16 %>% mutate(Stage = "PCW21")
+sig_pcw24 <- sig_pcw24_vs_pcw16 %>% mutate(Stage = "PCW24")
+
+# Combine into one data frame
+volcano_combined <- bind_rows(sig_pcw20, sig_pcw21, sig_pcw24)
+
+# Define significance
+volcano_combined$Significant <- ifelse(volcano_combined$p_val_adj < 0.05 & abs(volcano_combined$avg_log2FC) > 0.25, "Yes", "No")
+
+# Plot
+ggplot(volcano_combined, aes(x = avg_log2FC, y = -log10(p_val_adj), color = Stage)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", color = "grey") +
+  theme_minimal() +
+  labs(title = "Differential Accessibility Volcano Plots Across Developmental Stages",
+       x = "log2 Fold Change",
+       y = "-log10 Adjusted P-value") +
+  scale_color_manual(values = c("PCW20" = "blue", "PCW21" = "green", "PCW24" = "red")) +
+  theme(legend.title = element_text(size = 10), legend.position = "top")
+
+```
+
+```{r}
+library(dplyr)
+library(knitr)
+
+# Helper function to get top 5 motifs per stage
+get_top_motifs <- function(motif_results, stage_name) {
+  motif_results %>%
+    dplyr::select(motif, TF, fold.enrichment, p.adjust, observed) %>%
+    dplyr::filter(p.adjust < 0.05) %>%       # significant motifs only
+    dplyr::arrange(desc(fold.enrichment)) %>%
+    dplyr::slice_head(n = 5) %>%            # top 5
+    dplyr::mutate(Stage = stage_name)        # add stage column
+}
+
+# Get top 5 motifs for each stage
+top_PCW20 <- get_top_motifs(motif_results_PCW20, "PCW20")
+top_PCW21 <- get_top_motifs(motif_results_PCW21, "PCW21")
+top_PCW24 <- get_top_motifs(motif_results_PCW24, "PCW24")
+
+# Combine into one table
+top_motifs_all <- bind_rows(top_PCW20, top_PCW21, top_PCW24) %>%
+  dplyr::select(Stage, motif, TF, fold.enrichment, p.adjust, observed)
+
+# Create nice table
+kable(top_motifs_all,
+      caption = "Top 5 Enriched Motifs per Developmental Stage",
+      col.names = c("Stage", "Motif ID", "Transcription Factor", "Fold Enrichment", "Adjusted P-value", "# Peaks"),
+      digits = 3)
+
+```
+
